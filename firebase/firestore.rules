@@ -1,0 +1,955 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes and enforces the following data structures
+// for the DeployHQ Developer Deployment & Monitoring SaaS Platform:
+//
+// 1. Collection: users/{uid}
+//    Fields:
+//      - uid: string (required, immutable, matches path {uid})
+//      - email: string (required, valid email format, <= 254 chars)
+//      - displayName: string (optional, <= 120 chars)
+//      - photoURL: string (optional, valid URL, <= 1024 chars)
+//      - defaultWorkspaceId: string (optional, <= 128 chars)
+//      - onboardingCompleted: bool (optional)
+//      - preferences: map (optional, <= 20 keys)
+//      - role: string (optional, privileged/immutable by client)
+//      - isSuperAdmin: bool (optional, privileged/immutable by client)
+//      - planOverride: string (optional, privileged/immutable by client)
+//      - createdAt: timestamp | string (optional, immutable on update)
+//      - updatedAt: timestamp | string (optional)
+//
+// 2. Collection: workspaces/{workspaceId}
+//    Fields:
+//      - id: string (optional, immutable on update, <= 128 chars)
+//      - name: string (required, 1..100 chars)
+//      - slug: string (optional, <= 100 chars)
+//      - ownerId: string (required, immutable unless current owner transfers, <= 128 chars)
+//      - plan: string (optional, in ['free', 'pro', 'team', 'enterprise'], <= 32 chars)
+//      - isDemo: bool (optional, immutable by non-owner)
+//      - avatarUrl: string (optional, <= 1024 chars)
+//      - settings: map (optional, <= 30 keys)
+//      - memberCount: number (optional, >= 0)
+//      - projectCount: number (optional, >= 0)
+//      - createdAt: timestamp | string (optional, immutable on update)
+//      - updatedAt: timestamp | string (optional)
+//
+// 3. Subcollection: workspaces/{workspaceId}/members/{memberUid}
+//    Fields:
+//      - uid: string (required, immutable, matches {memberUid}, <= 128 chars)
+//      - email: string (required, valid email, <= 254 chars)
+//      - displayName: string (optional, <= 120 chars)
+//      - photoURL: string (optional, <= 1024 chars)
+//      - role: string (required, in ['owner', 'admin', 'developer', 'viewer'])
+//      - status: string (optional, in ['active', 'invited', 'suspended'])
+//      - invitedBy: string (optional, <= 128 chars)
+//      - joinedAt: timestamp | string (optional, immutable on update)
+//      - updatedAt: timestamp | string (optional)
+//
+// 4. Subcollection: workspaces/{workspaceId}/projects/{projectId}
+//    Fields:
+//      - name: string (required, 1..120 chars)
+//      - repoUrl / repository / framework / branch / buildCommand / outputDir / rootDir / productionUrl / status: string (optional, <= 1024 chars)
+//      - autoDeploy: bool (optional)
+//      - createdAt: timestamp | string (optional, immutable on update)
+//
+// 5. Subcollections:
+//    - workspaces/{workspaceId}/deployments/{deploymentId}
+//    - workspaces/{workspaceId}/deployments/{deploymentId}/logs/{logId}
+//    - workspaces/{workspaceId}/monitors/{monitorId}
+//    - workspaces/{workspaceId}/monitorChecks/{checkId}
+//    - workspaces/{workspaceId}/errors/{errorId}
+//    - workspaces/{workspaceId}/alerts/{alertId}
+//    - workspaces/{workspaceId}/notifications/{notificationId}
+//    - workspaces/{workspaceId}/activity/{activityId} (immutable audit log)
+//    - workspaces/{workspaceId}/integrations/{integrationId} (non-sensitive metadata only)
+//    - workspaces/{workspaceId}/integrationSecrets/{secretId} (admin SDK only - client denied)
+//    - workspaces/{workspaceId}/environments/{environmentId} (masked metadata only)
+//    - workspaces/{workspaceId}/environmentSecrets/{secretId} (admin SDK only - client denied)
+//    - workspaces/{workspaceId}/subscriptions/{subscriptionId}
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the resource by userId parameter
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if user is owner based on existing document's uid field
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    // Verify UID hasn't been tampered with on create
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    // Ensure uid field is not modified on update
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        !('uid' in resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    // Validate required fields exist
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only the allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate that immutable fields have not been modified on update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate required string field with length constraints
+    function validStringLength(field, minLen, maxLen) {
+      return (field in request.resource.data) &&
+        request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate optional string field (if present and non-null, must be string within length bounds)
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= minLen &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    // Validate optional boolean field
+    function isValidOptionalBool(field) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        request.resource.data[field] is bool;
+    }
+
+    // Validate optional number field within range
+    function isValidOptionalNumber(field, minVal, maxVal) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        ((request.resource.data[field] is int || request.resource.data[field] is float) &&
+         request.resource.data[field] >= minVal &&
+         request.resource.data[field] <= maxVal);
+    }
+
+    // Validate optional timestamp or bounded ISO date string
+    function isValidOptionalTime(field) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        request.resource.data[field] is timestamp ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() <= 64);
+    }
+
+    // Validate optional list with maximum size
+    function isValidOptionalList(field, maxSize) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        (request.resource.data[field] is list &&
+         request.resource.data[field].size() <= maxSize);
+    }
+
+    // Validate optional map with maximum key count
+    function isValidOptionalMap(field, maxKeys) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        (request.resource.data[field] is map &&
+         request.resource.data[field].keys().size() <= maxKeys);
+    }
+
+    // Validate URL format (must start with https:// or http://)
+    function isValidUrl(url) {
+      return url is string &&
+        url.size() <= 2048 &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() >= 3 &&
+        email.size() <= 254 &&
+        email.matches("^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Bound overall document key count to prevent schema pollution / resource exhaustion
+    function isBoundedDoc(maxKeys) {
+      return request.resource.data.keys().size() > 0 &&
+        request.resource.data.keys().size() <= maxKeys;
+    }
+
+    // ===============================================================
+    // Workspace RBAC Helpers
+    // ===============================================================
+
+    function memberPath(workspaceId, uid) {
+      return /databases/$(database)/documents/workspaces/$(workspaceId)/members/$(uid);
+    }
+
+    function workspacePath(workspaceId) {
+      return /databases/$(database)/documents/workspaces/$(workspaceId);
+    }
+
+    // Check if the authenticated user has a member document in the workspace
+    function hasMemberDoc(workspaceId) {
+      return isAuthenticated() && exists(memberPath(workspaceId, request.auth.uid));
+    }
+
+    // Retrieve the authenticated user's role from their member document
+    function getMemberRole(workspaceId) {
+      return get(memberPath(workspaceId, request.auth.uid)).data.role;
+    }
+
+    // Check if the authenticated user is recorded as ownerId on the workspace document
+    function isWorkspaceDocOwner(workspaceId) {
+      return isAuthenticated() &&
+        exists(workspacePath(workspaceId)) &&
+        get(workspacePath(workspaceId)).data.ownerId == request.auth.uid;
+    }
+
+    // Check if workspace is flagged as the read-only demo workspace
+    function isDemoWorkspace(workspaceId) {
+      return isAuthenticated() &&
+        exists(workspacePath(workspaceId)) &&
+        get(workspacePath(workspaceId)).data.get('isDemo', false) == true;
+    }
+
+    // Check if user is any member of the workspace (owner, admin, developer, viewer) or demo reader
+    function isWorkspaceMember(workspaceId) {
+      return isAuthenticated() && (
+        (hasMemberDoc(workspaceId) &&
+         getMemberRole(workspaceId) in ['owner', 'admin', 'developer', 'viewer']) ||
+        isWorkspaceDocOwner(workspaceId) ||
+        isDemoWorkspace(workspaceId)
+      );
+    }
+
+    // Check if user has one of the specified roles in the workspace
+    function hasWorkspaceRole(workspaceId, allowedRoles) {
+      return isAuthenticated() && (
+        (hasMemberDoc(workspaceId) && getMemberRole(workspaceId) in allowedRoles) ||
+        ('owner' in allowedRoles && isWorkspaceDocOwner(workspaceId))
+      );
+    }
+
+    // Role tier shortcuts
+    function isWorkspaceOwner(workspaceId) {
+      return hasWorkspaceRole(workspaceId, ['owner']);
+    }
+
+    function isWorkspaceAdmin(workspaceId) {
+      return hasWorkspaceRole(workspaceId, ['owner', 'admin']);
+    }
+
+    function isWorkspaceDeveloper(workspaceId) {
+      return hasWorkspaceRole(workspaceId, ['owner', 'admin', 'developer']);
+    }
+
+    // ===============================================================
+    // Domain Validators (Called on BOTH create and update)
+    // ===============================================================
+
+    // 1. User Profile Validator
+    function isValidUser(data, uid) {
+      return isBoundedDoc(25) &&
+        (!('uid' in data) || (data.uid is string && data.uid == uid)) &&
+        (!('email' in data) || data.email == null || isValidEmail(data.email)) &&
+        isValidOptionalString('displayName', 0, 120) &&
+        isValidOptionalString('name', 0, 120) &&
+        isValidOptionalString('photoURL', 0, 1024) &&
+        isValidOptionalString('avatarUrl', 0, 1024) &&
+        isValidOptionalString('bio', 0, 500) &&
+        isValidOptionalString('title', 0, 120) &&
+        isValidOptionalString('company', 0, 120) &&
+        isValidOptionalString('timezone', 0, 64) &&
+        isValidOptionalString('defaultWorkspaceId', 0, 128) &&
+        isValidOptionalString('activeWorkspaceId', 0, 128) &&
+        isValidOptionalBool('onboardingCompleted') &&
+        isValidOptionalMap('preferences', 30) &&
+        isValidOptionalMap('notificationSettings', 30) &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt') &&
+        isValidOptionalTime('lastLoginAt');
+    }
+
+    // 2. Workspace Validator
+    function isValidWorkspace(data) {
+      return isBoundedDoc(30) &&
+        hasRequiredFields(['name', 'ownerId']) &&
+        validStringLength('name', 1, 100) &&
+        validStringLength('ownerId', 1, 128) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('slug', 1, 100) &&
+        isValidOptionalString('description', 0, 500) &&
+        isValidOptionalString('avatarUrl', 0, 1024) &&
+        isValidOptionalString('plan', 1, 32) &&
+        (!('plan' in data) || data.plan in ['free', 'pro', 'team', 'enterprise', 'starter', 'business']) &&
+        isValidOptionalBool('isDemo') &&
+        isValidOptionalNumber('memberCount', 0, 100000) &&
+        isValidOptionalNumber('projectCount', 0, 100000) &&
+        isValidOptionalMap('settings', 30) &&
+        isValidOptionalMap('usage', 30) &&
+        isValidOptionalMap('limits', 30) &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 3. Workspace Member Validator
+    function isValidMember(data, memberUid) {
+      return isBoundedDoc(20) &&
+        hasRequiredFields(['role']) &&
+        data.role is string &&
+        data.role in ['owner', 'admin', 'developer', 'viewer'] &&
+        (!('uid' in data) || (data.uid is string && data.uid == memberUid)) &&
+        (!('email' in data) || data.email == null || isValidEmail(data.email)) &&
+        isValidOptionalString('displayName', 0, 120) &&
+        isValidOptionalString('name', 0, 120) &&
+        isValidOptionalString('photoURL', 0, 1024) &&
+        isValidOptionalString('avatarUrl', 0, 1024) &&
+        isValidOptionalString('status', 1, 32) &&
+        isValidOptionalString('invitedBy', 0, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalTime('joinedAt') &&
+        isValidOptionalTime('invitedAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 4. Project Validator
+    function isValidProject(data) {
+      return isBoundedDoc(35) &&
+        hasRequiredFields(['name']) &&
+        validStringLength('name', 1, 120) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('slug', 1, 120) &&
+        isValidOptionalString('description', 0, 1000) &&
+        isValidOptionalString('repoUrl', 0, 1024) &&
+        isValidOptionalString('repository', 0, 512) &&
+        isValidOptionalString('repoOwner', 0, 128) &&
+        isValidOptionalString('repoName', 0, 128) &&
+        isValidOptionalString('framework', 0, 64) &&
+        isValidOptionalString('branch', 0, 128) &&
+        isValidOptionalString('productionBranch', 0, 128) &&
+        isValidOptionalString('buildCommand', 0, 512) &&
+        isValidOptionalString('installCommand', 0, 512) &&
+        isValidOptionalString('outputDir', 0, 256) &&
+        isValidOptionalString('rootDir', 0, 256) &&
+        isValidOptionalString('nodeVersion', 0, 32) &&
+        isValidOptionalString('productionUrl', 0, 1024) &&
+        isValidOptionalString('domain', 0, 256) &&
+        isValidOptionalString('status', 0, 64) &&
+        isValidOptionalString('region', 0, 64) &&
+        isValidOptionalString('createdBy', 0, 128) &&
+        isValidOptionalBool('autoDeploy') &&
+        isValidOptionalList('domains', 25) &&
+        isValidOptionalList('tags', 25) &&
+        isValidOptionalTime('lastDeployedAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 5. Deployment & Deployment Log Validators
+    function isValidDeployment(data) {
+      return isBoundedDoc(35) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 1, 128) &&
+        isValidOptionalString('projectName', 0, 120) &&
+        isValidOptionalString('environment', 1, 64) &&
+        isValidOptionalString('status', 1, 64) &&
+        isValidOptionalString('branch', 0, 128) &&
+        isValidOptionalString('commitSha', 0, 64) &&
+        isValidOptionalString('commitHash', 0, 64) &&
+        isValidOptionalString('commitMessage', 0, 1000) &&
+        isValidOptionalString('commitAuthor', 0, 128) &&
+        isValidOptionalString('authorName', 0, 128) &&
+        isValidOptionalString('authorAvatar', 0, 1024) &&
+        isValidOptionalString('triggeredBy', 0, 128) &&
+        isValidOptionalString('trigger', 0, 64) &&
+        isValidOptionalString('url', 0, 1024) &&
+        isValidOptionalString('previewUrl', 0, 1024) &&
+        isValidOptionalString('errorMessage', 0, 2000) &&
+        isValidOptionalString('rollbackFromId', 0, 128) &&
+        isValidOptionalNumber('duration', 0, 86400000) &&
+        isValidOptionalNumber('durationMs', 0, 86400000) &&
+        isValidOptionalNumber('buildDurationMs', 0, 86400000) &&
+        isValidOptionalList('logs', 200) &&
+        isValidOptionalMap('metadata', 30) &&
+        isValidOptionalTime('startedAt') &&
+        isValidOptionalTime('completedAt') &&
+        isValidOptionalTime('finishedAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    function isValidDeploymentLog(data) {
+      return isBoundedDoc(15) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('deploymentId', 1, 128) &&
+        isValidOptionalString('level', 1, 32) &&
+        isValidOptionalString('step', 0, 128) &&
+        isValidOptionalString('message', 0, 10000) &&
+        isValidOptionalString('stream', 0, 32) &&
+        isValidOptionalNumber('sequence', 0, 1000000) &&
+        isValidOptionalNumber('line', 0, 1000000) &&
+        isValidOptionalTime('timestamp') &&
+        isValidOptionalTime('createdAt');
+    }
+
+    // 6. Monitor & MonitorCheck Validators
+    function isValidMonitor(data) {
+      return isBoundedDoc(35) &&
+        hasRequiredFields(['name', 'url']) &&
+        validStringLength('name', 1, 120) &&
+        validStringLength('url', 1, 1024) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 0, 128) &&
+        isValidOptionalString('projectName', 0, 120) &&
+        isValidOptionalString('method', 1, 16) &&
+        isValidOptionalString('type', 1, 32) &&
+        isValidOptionalString('status', 1, 32) &&
+        isValidOptionalString('lastError', 0, 2000) &&
+        isValidOptionalNumber('intervalSeconds', 10, 86400) &&
+        isValidOptionalNumber('interval', 1, 86400) &&
+        isValidOptionalNumber('timeoutMs', 100, 120000) &&
+        isValidOptionalNumber('timeout', 1, 120000) &&
+        isValidOptionalNumber('expectedStatus', 100, 599) &&
+        isValidOptionalNumber('expectedStatusCode', 100, 599) &&
+        isValidOptionalNumber('uptimePercentage', 0, 100) &&
+        isValidOptionalNumber('uptime', 0, 100) &&
+        isValidOptionalNumber('avgLatencyMs', 0, 120000) &&
+        isValidOptionalNumber('latencyMs', 0, 120000) &&
+        isValidOptionalNumber('lastStatusCode', 0, 599) &&
+        isValidOptionalBool('enabled') &&
+        isValidOptionalBool('paused') &&
+        isValidOptionalList('regions', 20) &&
+        isValidOptionalList('history', 100) &&
+        isValidOptionalMap('headers', 25) &&
+        isValidOptionalTime('lastCheckedAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    function isValidMonitorCheck(data) {
+      return isBoundedDoc(20) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('monitorId', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('status', 1, 32) &&
+        isValidOptionalString('region', 0, 64) &&
+        isValidOptionalString('errorMessage', 0, 2000) &&
+        isValidOptionalNumber('statusCode', 0, 599) &&
+        isValidOptionalNumber('latencyMs', 0, 120000) &&
+        isValidOptionalNumber('responseTimeMs', 0, 120000) &&
+        isValidOptionalBool('up') &&
+        isValidOptionalBool('success') &&
+        isValidOptionalTime('checkedAt') &&
+        isValidOptionalTime('timestamp') &&
+        isValidOptionalTime('createdAt');
+    }
+
+    // 7. Error Validator
+    function isValidError(data) {
+      return isBoundedDoc(35) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 0, 128) &&
+        isValidOptionalString('projectName', 0, 120) &&
+        isValidOptionalString('environment', 0, 64) &&
+        isValidOptionalString('title', 0, 500) &&
+        isValidOptionalString('message', 0, 4000) &&
+        isValidOptionalString('type', 0, 128) &&
+        isValidOptionalString('level', 0, 32) &&
+        isValidOptionalString('severity', 0, 32) &&
+        isValidOptionalString('status', 0, 32) &&
+        isValidOptionalString('fingerprint', 0, 256) &&
+        isValidOptionalString('stackTrace', 0, 20000) &&
+        isValidOptionalString('stack', 0, 20000) &&
+        isValidOptionalString('aiDiagnosis', 0, 10000) &&
+        isValidOptionalString('aiSuggestedFix', 0, 10000) &&
+        isValidOptionalString('assigneeId', 0, 128) &&
+        isValidOptionalString('resolvedBy', 0, 128) &&
+        isValidOptionalString('release', 0, 128) &&
+        isValidOptionalNumber('count', 0, 1000000000) &&
+        isValidOptionalNumber('eventCount', 0, 1000000000) &&
+        isValidOptionalNumber('affectedUsers', 0, 1000000000) &&
+        isValidOptionalList('tags', 30) &&
+        isValidOptionalList('breadcrumbs', 100) &&
+        isValidOptionalMap('context', 30) &&
+        isValidOptionalMap('aiAnalysis', 20) &&
+        isValidOptionalTime('firstSeenAt') &&
+        isValidOptionalTime('lastSeenAt') &&
+        isValidOptionalTime('resolvedAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 8. Alert Validator
+    function isValidAlert(data) {
+      return isBoundedDoc(30) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 0, 128) &&
+        isValidOptionalString('monitorId', 0, 128) &&
+        isValidOptionalString('name', 1, 120) &&
+        isValidOptionalString('type', 1, 64) &&
+        isValidOptionalString('condition', 0, 256) &&
+        isValidOptionalString('metric', 0, 64) &&
+        isValidOptionalString('operator', 0, 32) &&
+        isValidOptionalString('severity', 0, 32) &&
+        isValidOptionalString('status', 0, 32) &&
+        isValidOptionalString('channel', 0, 64) &&
+        isValidOptionalString('target', 0, 512) &&
+        isValidOptionalNumber('threshold', -1000000000, 1000000000) &&
+        isValidOptionalNumber('cooldownMinutes', 0, 10080) &&
+        isValidOptionalBool('enabled') &&
+        isValidOptionalList('channels', 20) &&
+        isValidOptionalList('recipients', 50) &&
+        isValidOptionalTime('lastTriggeredAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 9. Notification Validator
+    function isValidNotification(data) {
+      return isBoundedDoc(25) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('userId', 0, 128) &&
+        isValidOptionalString('title', 1, 256) &&
+        isValidOptionalString('message', 0, 2000) &&
+        isValidOptionalString('body', 0, 2000) &&
+        isValidOptionalString('type', 0, 64) &&
+        isValidOptionalString('severity', 0, 32) &&
+        isValidOptionalString('link', 0, 1024) &&
+        isValidOptionalString('resourceId', 0, 128) &&
+        isValidOptionalString('resourceType', 0, 64) &&
+        isValidOptionalBool('read') &&
+        isValidOptionalBool('isRead') &&
+        isValidOptionalTime('readAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 10. Activity Audit Log Validator
+    function isValidActivity(data) {
+      return isBoundedDoc(25) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 0, 128) &&
+        isValidOptionalString('actorId', 0, 128) &&
+        isValidOptionalString('actorUid', 0, 128) &&
+        isValidOptionalString('userId', 0, 128) &&
+        isValidOptionalString('actorName', 0, 128) &&
+        isValidOptionalString('actorEmail', 0, 254) &&
+        isValidOptionalString('actorAvatar', 0, 1024) &&
+        isValidOptionalString('action', 1, 128) &&
+        isValidOptionalString('type', 0, 64) &&
+        isValidOptionalString('targetType', 0, 64) &&
+        isValidOptionalString('targetId', 0, 128) &&
+        isValidOptionalString('targetName', 0, 256) &&
+        isValidOptionalString('description', 0, 1000) &&
+        isValidOptionalString('message', 0, 1000) &&
+        isValidOptionalMap('metadata', 25) &&
+        isValidOptionalTime('timestamp') &&
+        isValidOptionalTime('createdAt');
+    }
+
+    // 11. Integration Validator (Non-sensitive metadata ONLY; forbid raw secret fields)
+    function isValidIntegration(data) {
+      return isBoundedDoc(25) &&
+        !request.resource.data.keys().hasAny([
+          'accessToken', 'refreshToken', 'secret', 'clientSecret',
+          'apiKey', 'privateKey', 'webhookSecret', 'rawSecret', 'token'
+        ]) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('provider', 1, 64) &&
+        isValidOptionalString('name', 0, 120) &&
+        isValidOptionalString('type', 0, 64) &&
+        isValidOptionalString('status', 0, 32) &&
+        isValidOptionalString('connectedUsername', 0, 128) &&
+        isValidOptionalString('accountName', 0, 128) &&
+        isValidOptionalString('accountAvatar', 0, 1024) &&
+        isValidOptionalString('webhookUrlMasked', 0, 256) &&
+        isValidOptionalString('channelName', 0, 128) &&
+        isValidOptionalString('connectedBy', 0, 128) &&
+        isValidOptionalBool('enabled') &&
+        isValidOptionalBool('connected') &&
+        isValidOptionalList('scopes', 30) &&
+        isValidOptionalList('events', 30) &&
+        isValidOptionalMap('config', 25) &&
+        isValidOptionalTime('connectedAt') &&
+        isValidOptionalTime('lastSyncedAt') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 13. Environment Variable Metadata Validator (Masked metadata ONLY; forbid plaintext secret values)
+    function isValidEnvironment(data) {
+      return isBoundedDoc(25) &&
+        !request.resource.data.keys().hasAny([
+          'rawValue', 'secretValue', 'plainValue', 'plaintext', 'decryptedValue'
+        ]) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('projectId', 0, 128) &&
+        isValidOptionalString('key', 1, 128) &&
+        isValidOptionalString('name', 1, 128) &&
+        isValidOptionalString('target', 1, 64) &&
+        isValidOptionalString('environment', 1, 64) &&
+        isValidOptionalString('maskedPreview', 0, 128) &&
+        isValidOptionalString('maskedValue', 0, 128) &&
+        isValidOptionalString('valuePreview', 0, 128) &&
+        isValidOptionalString('secretId', 0, 128) &&
+        isValidOptionalString('description', 0, 500) &&
+        isValidOptionalString('createdBy', 0, 128) &&
+        isValidOptionalString('updatedBy', 0, 128) &&
+        isValidOptionalBool('isSecret') &&
+        isValidOptionalList('targets', 10) &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt');
+    }
+
+    // 15. Subscription / Billing Request Validator
+    // Clients (workspace owners) may only create/update non-verified checkout/portal requests
+    // and can NEVER self-activate a paid subscription (`status == 'active'` with a paid plan).
+    function isValidSubscriptionWrite(data) {
+      return isBoundedDoc(25) &&
+        isValidOptionalString('id', 1, 128) &&
+        isValidOptionalString('workspaceId', 1, 128) &&
+        isValidOptionalString('plan', 1, 32) &&
+        isValidOptionalString('requestedPlan', 1, 32) &&
+        isValidOptionalString('billingCycle', 1, 32) &&
+        isValidOptionalString('interval', 1, 32) &&
+        isValidOptionalString('status', 1, 32) &&
+        isValidOptionalString('checkoutSessionId', 0, 256) &&
+        isValidOptionalString('customerId', 0, 256) &&
+        isValidOptionalString('subscriptionId', 0, 256) &&
+        isValidOptionalBool('cancelAtPeriodEnd') &&
+        isValidOptionalTime('currentPeriodStart') &&
+        isValidOptionalTime('currentPeriodEnd') &&
+        isValidOptionalTime('createdAt') &&
+        isValidOptionalTime('updatedAt') &&
+        // Disallow client self-activation of paid subscription status
+        (
+          !('status' in data) ||
+          data.status in ['incomplete', 'pending', 'checkout_requested', 'canceled', 'trialing'] ||
+          (data.status == 'active' && data.get('plan', 'free') == 'free')
+        );
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // ---------------------------------------------------------------
+    // 1. Users Collection: /users/{uid}
+    // ---------------------------------------------------------------
+    match /users/{uid} {
+      // Strictly limit read access to the profile owner (PII protection)
+      allow read: if isOwner(uid);
+
+      // Users can create their own profile, but cannot set privileged fields
+      allow create: if isOwner(uid) &&
+        uidUnchanged() &&
+        isValidUser(request.resource.data, uid) &&
+        !request.resource.data.keys().hasAny(['role', 'isSuperAdmin', 'planOverride']);
+
+      // Users can update their own profile, but MUST NOT modify privileged or immutable fields
+      allow update: if isOwner(uid) &&
+        uidNotModified() &&
+        isValidUser(request.resource.data, uid) &&
+        areImmutableFieldsUnchanged(['role', 'isSuperAdmin', 'planOverride', 'createdAt', 'uid']);
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Workspaces Collection: /workspaces/{workspaceId}
+    // ---------------------------------------------------------------
+    match /workspaces/{workspaceId} {
+      // Read allowed if authenticated member of workspace, workspace ownerId, or demo workspace
+      allow read: if isAuthenticated() && (
+        resource.data.ownerId == request.auth.uid ||
+        resource.data.get('isDemo', false) == true ||
+        hasMemberDoc(workspaceId)
+      );
+
+      // Create allowed if authenticated and ownerId is set to caller's uid
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        isValidWorkspace(request.resource.data) &&
+        request.resource.data.get('isDemo', false) == false;
+
+      // Update allowed if member role is owner or admin; cannot change ownerId unless owner
+      allow update: if isWorkspaceAdmin(workspaceId) &&
+        isValidWorkspace(request.resource.data) &&
+        areImmutableFieldsUnchanged(['id', 'createdAt', 'isDemo']) &&
+        (
+          request.resource.data.ownerId == resource.data.ownerId ||
+          isWorkspaceOwner(workspaceId)
+        );
+
+      // Delete allowed only if member role is owner
+      allow delete: if isWorkspaceOwner(workspaceId);
+
+      // -------------------------------------------------------------
+      // 3. Workspace Members: /workspaces/{workspaceId}/members/{memberUid}
+      // -------------------------------------------------------------
+      match /members/{memberUid} {
+        allow read: if isWorkspaceMember(workspaceId);
+
+        // Create:
+        // - Self-creation as 'owner' ONLY when caller is the workspace's ownerId
+        // - OR by workspace 'owner' (can assign any valid role)
+        // - OR by workspace 'admin' (can only assign 'developer' or 'viewer', never 'owner' or self-escalate)
+        allow create: if isAuthenticated() &&
+          isValidMember(request.resource.data, memberUid) && (
+            (
+              memberUid == request.auth.uid &&
+              request.resource.data.role == 'owner' &&
+              isWorkspaceDocOwner(workspaceId)
+            ) ||
+            isWorkspaceOwner(workspaceId) ||
+            (
+              isWorkspaceAdmin(workspaceId) &&
+              memberUid != request.auth.uid &&
+              request.resource.data.role in ['developer', 'viewer']
+            )
+          );
+
+        // Update:
+        // - 'owner' can manage all members
+        // - 'admin' can manage 'developer' and 'viewer' members, cannot modify an 'owner' or assign 'owner'
+        // - Users cannot elevate their own role
+        allow update: if isAuthenticated() &&
+          isValidMember(request.resource.data, memberUid) &&
+          areImmutableFieldsUnchanged(['uid', 'joinedAt']) && (
+            isWorkspaceOwner(workspaceId) ||
+            (
+              isWorkspaceAdmin(workspaceId) &&
+              memberUid != request.auth.uid &&
+              resource.data.role in ['developer', 'viewer'] &&
+              request.resource.data.role in ['developer', 'viewer']
+            )
+          );
+
+        // Delete:
+        // - 'owner' can remove any non-owner member (or any member)
+        // - 'admin' can remove 'developer' and 'viewer' members, never an 'owner'
+        allow delete: if isAuthenticated() && (
+          isWorkspaceOwner(workspaceId) ||
+          (
+            isWorkspaceAdmin(workspaceId) &&
+            resource.data.role in ['developer', 'viewer']
+          )
+        );
+      }
+
+      // -------------------------------------------------------------
+      // 4. Projects: /workspaces/{workspaceId}/projects/{projectId}
+      // -------------------------------------------------------------
+      match /projects/{projectId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidProject(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidProject(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt', 'createdBy']);
+        allow delete: if isWorkspaceAdmin(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 5. Deployments & Deployment Logs
+      // -------------------------------------------------------------
+      match /deployments/{deploymentId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidDeployment(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidDeployment(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'projectId', 'createdAt']);
+        allow delete: if isWorkspaceAdmin(workspaceId);
+
+        match /logs/{logId} {
+          allow read: if isWorkspaceMember(workspaceId);
+          allow create: if isWorkspaceDeveloper(workspaceId) &&
+            isValidDeploymentLog(request.resource.data);
+          allow update: if isWorkspaceDeveloper(workspaceId) &&
+            isValidDeploymentLog(request.resource.data) &&
+            areImmutableFieldsUnchanged(['id', 'deploymentId', 'createdAt']);
+          allow delete: if isWorkspaceAdmin(workspaceId);
+        }
+      }
+
+      // -------------------------------------------------------------
+      // 6. Monitors & MonitorChecks
+      // -------------------------------------------------------------
+      match /monitors/{monitorId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidMonitor(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidMonitor(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt']);
+        allow delete: if isWorkspaceDeveloper(workspaceId);
+      }
+
+      match /monitorChecks/{checkId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidMonitorCheck(request.resource.data);
+        allow update, delete: if false;
+      }
+
+      // -------------------------------------------------------------
+      // 7. Errors: /workspaces/{workspaceId}/errors/{errorId}
+      // -------------------------------------------------------------
+      match /errors/{errorId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidError(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidError(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'firstSeenAt', 'createdAt']);
+        allow delete: if isWorkspaceAdmin(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 8. Alerts: /workspaces/{workspaceId}/alerts/{alertId}
+      // -------------------------------------------------------------
+      match /alerts/{alertId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidAlert(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidAlert(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt']);
+        allow delete: if isWorkspaceDeveloper(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 9. Notifications: /workspaces/{workspaceId}/notifications/{notificationId}
+      // -------------------------------------------------------------
+      match /notifications/{notificationId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidNotification(request.resource.data);
+        // Any workspace member can mark as read if ONLY updating read/isRead/readAt/updatedAt;
+        // developers/admins/owners can also perform validated updates keeping immutable fields intact
+        allow update: if isValidNotification(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt']) && (
+            (
+              isWorkspaceMember(workspaceId) &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'isRead', 'readAt', 'updatedAt'])
+            ) ||
+            isWorkspaceDeveloper(workspaceId)
+          );
+        allow delete: if isWorkspaceDeveloper(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 10. Activity Audit Trail: /workspaces/{workspaceId}/activity/{activityId}
+      // -------------------------------------------------------------
+      match /activity/{activityId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidActivity(request.resource.data);
+        // Immutable audit trail: never allow client update or delete
+        allow update, delete: if false;
+      }
+
+      // -------------------------------------------------------------
+      // 11. Integrations (Non-sensitive metadata only)
+      // -------------------------------------------------------------
+      match /integrations/{integrationId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceAdmin(workspaceId) &&
+          isValidIntegration(request.resource.data);
+        allow update: if isWorkspaceAdmin(workspaceId) &&
+          isValidIntegration(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt']);
+        allow delete: if isWorkspaceAdmin(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 12. Integration Secrets (Server-side Admin SDK ONLY)
+      // -------------------------------------------------------------
+      match /integrationSecrets/{secretId} {
+        allow read, write: if false;
+      }
+
+      // -------------------------------------------------------------
+      // 13. Environments (Masked variable metadata only)
+      // -------------------------------------------------------------
+      match /environments/{environmentId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if isWorkspaceDeveloper(workspaceId) &&
+          isValidEnvironment(request.resource.data);
+        allow update: if isWorkspaceDeveloper(workspaceId) &&
+          isValidEnvironment(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'createdAt', 'createdBy']);
+        allow delete: if isWorkspaceDeveloper(workspaceId);
+      }
+
+      // -------------------------------------------------------------
+      // 14. Environment Secrets (Server-side Admin SDK ONLY)
+      // -------------------------------------------------------------
+      match /environmentSecrets/{secretId} {
+        allow read, write: if false;
+      }
+
+      // -------------------------------------------------------------
+      // 15. Subscriptions: /workspaces/{workspaceId}/subscriptions/{subscriptionId}
+      // -------------------------------------------------------------
+      match /subscriptions/{subscriptionId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        // Only workspace owner may create/update non-verified checkout requests;
+        // active paid subscriptions can only be set by server-side Admin SDK
+        allow create: if isWorkspaceOwner(workspaceId) &&
+          isValidSubscriptionWrite(request.resource.data);
+        allow update: if isWorkspaceOwner(workspaceId) &&
+          isValidSubscriptionWrite(request.resource.data) &&
+          areImmutableFieldsUnchanged(['id', 'workspaceId', 'customerId', 'subscriptionId', 'createdAt']) &&
+          (
+            resource.data.get('status', 'free') != 'active' ||
+            request.resource.data.status == resource.data.status
+          );
+        allow delete: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // Default Deny All Other Paths
+    // ---------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

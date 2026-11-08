@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* MANDATORY (dark-mode guide): Apply color-scheme to :root or html for viewport-wide theming */
+:root {
+  --brand-accent-light: #6d5ce8;
+  --brand-accent-dark: #8B7CFF;
+  --accent-color: var(--brand-accent-light);
+  --scrollbar-track: #e5e7eb;
+  --scrollbar-thumb: #9ca3af;
+
+  /* MANDATORY: Fallback for browsers without light-dark support */
+  @media (prefers-color-scheme: dark) {
+    --accent-color: var(--brand-accent-dark);
+    --scrollbar-track: #0D1017;
+    --scrollbar-thumb: #242B38;
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --accent-color: light-dark(var(--brand-accent-light), var(--brand-accent-dark));
+    --scrollbar-track: light-dark(#e5e7eb, #0D1017);
+    --scrollbar-thumb: light-dark(#9ca3af, #242B38);
+  }
+
+  /* MANDATORY: Automatically adapt native UI to user system preferences */
+  color-scheme: light dark;
+  accent-color: var(--accent-color);
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+}
+
+html.dark {
+  color-scheme: dark;
+  --scrollbar-track: #0D1017;
+  --scrollbar-thumb: #242B38;
+}
+
+html.light {
+  color-scheme: light;
+  --scrollbar-track: #f1f5f9;
+  --scrollbar-thumb: #cbd5e1;
+}
+
+/* Light mode surface overrides when user selects Light appearance */
+html.light body {
+  background-color: #F8FAFC;
+  color: #0F172A;
+}
+
+html.light .bg-main {
+  background-color: #F8FAFC !important;
+}
+html.light .bg-sidebar {
+  background-color: #F1F5F9 !important;
+}
+html.light .bg-card {
+  background-color: #FFFFFF !important;
+}
+html.light .bg-elevated {
+  background-color: #F1F5F9 !important;
+}
+html.light .border-border {
+  border-color: #E2E8F0 !important;
+}
+html.light .text-text-primary {
+  color: #0F172A !important;
+}
+html.light .text-text-secondary {
+  color: #475569 !important;
+}
+html.light .text-text-muted {
+  color: #64748B !important;
+}
+
+/* Legacy fallback for WebKit/Blink browsers without scrollbar-color */
+@supports not (scrollbar-color: auto) {
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 5px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+}
+
+/* MANDATORY (dialog guide): Stop page scrolling behind modal dialogs without locking body overflow */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background-color: rgba(9, 11, 16, 0.75);
+  backdrop-filter: blur(4px);
+}
+
+/* MANDATORY (responsive-table guide): Container-query responsive data tables with sticky headers */
+.table-wrapper {
+  overflow: auto;
+  max-inline-size: 100%;
+  container-type: inline-size;
+}
+
+.table-wrapper table {
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+}
+
+.table-wrapper thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+}
+
+.table-wrapper tbody th {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: 1;
+  background-color: #11151E;
+}
+
+html.light .table-wrapper tbody th {
+  background-color: #FFFFFF;
+}
+
+@container (width < 600px) {
+  .table-wrapper.stack-on-mobile table,
+  .table-wrapper.stack-on-mobile thead,
+  .table-wrapper.stack-on-mobile tbody,
+  .table-wrapper.stack-on-mobile tr,
+  .table-wrapper.stack-on-mobile th,
+  .table-wrapper.stack-on-mobile td {
+    display: block;
+  }
+
+  .table-wrapper.stack-on-mobile thead {
+    /* MANDATORY: Hide column header from layout and screen readers */
+    display: none;
+  }
+
+  .table-wrapper.stack-on-mobile tr {
+    margin-block-end: 0.75rem;
+    border: 1px solid #242B38;
+    border-radius: 8px;
+    padding: 0.5rem;
+  }
+
+  .table-wrapper.stack-on-mobile tbody th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 2;
+  }
+}
+
